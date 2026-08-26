@@ -1,0 +1,23 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>SurveyGPS Admin</title>
+<style>body{font-family:system-ui;padding:24px;max-width:900px;margin:auto}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:6px 8px;text-align:left}th{background:#2E6B34;color:#fff}input,button{padding:6px 10px;margin:4px}</style>
+</head><body>
+<h2>🛰️ SurveyGPS — License Admin</h2>
+<p>Licenses: <b>{{lic_count}}</b> | Customers: <b>{{cust_count}}</b> | Devices: <b>{{dev_count}}</b></p>
+
+<h3>Create License</h3>
+<form method="post" action="/admin/license/create">
+<input name="customer_name" placeholder="Customer name" required>
+<input name="max_devices" type="number" value="1" min="1" style="width:70px"> devices
+<input name="days" type="number" value="365" style="width:80px"> days (0=lifetime)
+<button>Create</button>
+</form>
+
+<h3>Recent Licenses</h3>
+<table><tr><th>ID</th><th>Customer</th><th>Devices</th><th>Expires</th><th>Status</th></tr>
+{% for l in licenses %}
+<tr><td><code>{{l.id}}</code></td><td>{{l.customer.name if l.customer else "-"}}</td><td>{{l.devices|length}}/{{l.max_devices}}</td><td>{{l.expires_at or "lifetime"}}</td><td>{{"REVOKED" if l.is_revoked else "active"}}</td></tr>
+{% endfor %}
+</table>
+<p style="color:#666;font-size:13px">Admin auth: HTTP Basic <code>ADMIN_USER</code>/<code>ADMIN_PASS</code> env vars. Change defaults before production! Public key: <a href="/.well-known/public_key.pem">/.well-known/public_key.pem</a></p>
+</body></html>
