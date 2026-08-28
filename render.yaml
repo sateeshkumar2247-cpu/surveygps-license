@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: surveygps-license
+    name: sivanta-admin-license
     env: python
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
@@ -10,4 +10,6 @@ services:
       - key: ADMIN_PASS
         sync: false
       - key: DATABASE_URL
+        sync: false
+      - key: ED25519_PRIVATE_KEY_PEM
         sync: false

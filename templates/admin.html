@@ -1,23 +1,18 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>SurveyGPS Admin</title>
-<style>body{font-family:system-ui;padding:24px;max-width:900px;margin:auto}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:6px 8px;text-align:left}th{background:#2E6B34;color:#fff}input,button{padding:6px 10px;margin:4px}</style>
+<html><head><meta charset="utf-8"><title>SivantaAdmin License Server - STEP 4C</title>
+<style>body{font-family:system-ui,Segoe UI,Roboto,sans-serif;padding:24px;max-width:900px;margin:auto;background:#fafafa}header{background:#1B4332;color:#fff;padding:16px;border-radius:8px}table{border-collapse:collapse;width:100%;margin-top:16px}th,td{border:1px solid #ccc;padding:6px 8px;text-align:left}th{background:#2D6A4F;color:#fff}input,button{padding:6px 10px;margin:4px}code{background:#eee;padding:2px 6px;border-radius:4px}pre{white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid #ddd;padding:12px;border-radius:6px}</style>
 </head><body>
-<h2>🛰️ SurveyGPS — License Admin</h2>
-<p>Licenses: <b>{{lic_count}}</b> | Customers: <b>{{cust_count}}</b> | Devices: <b>{{dev_count}}</b></p>
-
-<h3>Create License</h3>
-<form method="post" action="/admin/license/create">
-<input name="customer_name" placeholder="Customer name" required>
-<input name="max_devices" type="number" value="1" min="1" style="width:70px"> devices
-<input name="days" type="number" value="365" style="width:80px"> days (0=lifetime)
-<button>Create</button>
-</form>
-
-<h3>Recent Licenses</h3>
-<table><tr><th>ID</th><th>Customer</th><th>Devices</th><th>Expires</th><th>Status</th></tr>
+<header><h2>SivantaAdmin — License Server (STEP 4C)</h2><p style="margin:0;opacity:.9">Dedicated license server • Ed25519 • SIVANTA1.*.* • 6 calendar months</p></header>
+<p style="color:#666;font-size:13px">Auth: HTTP Basic <code>ADMIN_USER</code>/<code>ADMIN_PASS</code> env vars (also accepts <code>ADMIN_PASSWORD</code>). Public key: <a href="/.well-known/public_key.pem">/.well-known/public_key.pem</a></p>
+<h3>Issue License (POST /admin/licenses)</h3>
+<p style="font-size:13px;color:#555">Example: <code>curl -u $ADMIN_USER:$ADMIN_PASS -X POST -H "Content-Type: application/json" -d "{\"customerId\":\"CUST001\",\"maxVillages\":20,\"maxDevices\":1}" https://your-server/admin/licenses</code></p>
+<h3>Recent Licenses ({{licenses|length}})</h3>
+<table><tr><th>License ID</th><th>Customer</th><th>Villages</th><th>Devices</th><th>Issued</th><th>Expires</th><th>Status</th></tr>
 {% for l in licenses %}
-<tr><td><code>{{l.id}}</code></td><td>{{l.customer.name if l.customer else "-"}}</td><td>{{l.devices|length}}/{{l.max_devices}}</td><td>{{l.expires_at or "lifetime"}}</td><td>{{"REVOKED" if l.is_revoked else "active"}}</td></tr>
+<tr><td><code>{{l.licenseId}}</code></td><td>{{l.customerId}}</td><td>{{l.maxVillages}}</td><td>{{l.maxDevices}}</td><td>{{l.issuedAt}}</td><td>{{l.expiresAt}}</td><td>{{l.status}}</td></tr>
+{% else %}
+<tr><td colspan="7" style="color:#888;text-align:center">No licenses yet</td></tr>
 {% endfor %}
 </table>
-<p style="color:#666;font-size:13px">Admin auth: HTTP Basic <code>ADMIN_USER</code>/<code>ADMIN_PASS</code> env vars. Change defaults before production! Public key: <a href="/.well-known/public_key.pem">/.well-known/public_key.pem</a></p>
+<p style="color:#666;font-size:13px">Product: <code>{{product}}</code> • Token format: <code>SIVANTA1.&lt;base64url(canonical-json)&gt;.&lt;base64url(ed25519-signature)&gt;</code></p>
 </body></html>

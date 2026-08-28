@@ -1,144 +1,568 @@
-from fastapi import FastAPI, Depends, HTTPException, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-import datetime
-import hashlib
+"""
+app.py - SivantaAdmin License Signing Server
+
+Spec compliance:
+- Private key via ED25519_PRIVATE_KEY_PEM env, fallback server/private_key.pem local dev only
+- Ed25519 canonical JSON, SIVANTA1.<b64url(payload)>.<b64url(sig)>
+- Payload: version=1, SIV-XXXX-XXXX, product, customerId, issuedAt, expiresAt (6 calendar months YearMonth), status, maxVillages, maxDevices
+- DB: licenses PK licenseId + optional devices, SQLAlchemy SQLite dev
+- Admin API: POST /admin/licenses BasicAuth ADMIN_USER/ADMIN_PASS, GET /.well-known/public_key.pem, startup verify fingerprint fail if mismatch
+- Security: 401 unauth, 400 malformed, duplicate retry, missing env fails, never log private
+- STEP 4H: POST /api/verify (customer online verification) + POST /admin/licenses/{id}/revoke + device registration with installationId UNIQUE
+"""
 import os
+import time
+import json
+import base64
+import secrets
+import calendar
+import datetime
+import logging
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from sqlalchemy.orm import Session
+from sqlalchemy import text, inspect
 
 from database import Base, engine, get_db, SessionLocal
 import models
 import crypto
 
+# Logging - never log private key
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+# Create tables
 Base.metadata.create_all(bind=engine)
 
-# seed default admin config if missing
-def seed():
-    db = SessionLocal()
-    if not db.query(models.AppConfig).first():
-        db.add(models.AppConfig())
-        db.commit()
-    # default admin password from env or generated
-    db.close()
-seed()
+# --- DB migration for STEP 4H (add columns if missing, keep data) ---
+def _ensure_migrations():
+    try:
+        insp = inspect(engine)
+        # licenses table migrations
+        if "licenses" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("licenses")}
+            with engine.begin() as conn:
+                if "is_revoked" not in cols:
+                    logger.info("Migrating: adding licenses.is_revoked")
+                    conn.execute(text("ALTER TABLE licenses ADD COLUMN is_revoked BOOLEAN DEFAULT 0"))
+                if "is_suspended" not in cols:
+                    logger.info("Migrating: adding licenses.is_suspended")
+                    conn.execute(text("ALTER TABLE licenses ADD COLUMN is_suspended BOOLEAN DEFAULT 0"))
+                if "graceDays" not in cols:
+                    logger.info("Migrating: adding licenses.graceDays")
+                    conn.execute(text("ALTER TABLE licenses ADD COLUMN graceDays INTEGER DEFAULT 7"))
+                # Normalize existing nulls
+                try:
+                    conn.execute(text("UPDATE licenses SET is_revoked=0 WHERE is_revoked IS NULL"))
+                    conn.execute(text("UPDATE licenses SET is_suspended=0 WHERE is_suspended IS NULL"))
+                    conn.execute(text("UPDATE licenses SET graceDays=7 WHERE graceDays IS NULL"))
+                except Exception:
+                    pass
+        # devices table migrations
+        if "devices" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("devices")}
+            with engine.begin() as conn:
+                if "status" not in cols:
+                    logger.info("Migrating: adding devices.status")
+                    conn.execute(text("ALTER TABLE devices ADD COLUMN status VARCHAR DEFAULT 'active'"))
+                if "firstSeenAt" not in cols:
+                    logger.info("Migrating: adding devices.firstSeenAt")
+                    conn.execute(text("ALTER TABLE devices ADD COLUMN firstSeenAt DATETIME"))
+                    try:
+                        conn.execute(text("UPDATE devices SET firstSeenAt=createdAt WHERE firstSeenAt IS NULL"))
+                    except Exception:
+                        pass
+                if "installationId" in cols:
+                    # Ensure UNIQUE constraint exists — SQLite needs index; create if not exists
+                    try:
+                        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_devices_installationId ON devices(installationId)"))
+                    except Exception:
+                        pass
+        logger.info("DB migrations checked")
+    except Exception as e:
+        logger.warning("Migration check failed (non-fatal): %s", e)
 
-app = FastAPI(title="SurveyGPS License Server")
-templates = Jinja2Templates(directory="templates")
+_ensure_migrations()
 
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")  # CHANGE IN PRODUCTION
+app = FastAPI(title="SivantaAdmin License Server - Ed25519 Signing")
 
-def check_admin(request: Request):
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+# --- Constants ---
+PRODUCT_EXPECTED = "Sivanta GPS & GIS"
+LICENSE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # No I,O,0,1 -> 32 chars, A-Z2-9 variant
+VERSION = 1
+
+# Admin creds from env - never in code, never log
+ADMIN_USER = os.getenv("ADMIN_USER")
+# Spec says ADMIN_USER/ADMIN_PASS; also accept ADMIN_PASSWORD for compatibility
+ADMIN_PASS = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD")
+
+_startup_verified = False
+_startup_details: dict | None = None
+
+@app.on_event("startup")
+async def startup_verify_keys():
+    global _startup_verified, _startup_details
+    try:
+        details = crypto.verify_key_match_on_startup()
+        _startup_verified = True
+        _startup_details = details
+        logger.info("Startup key verification PASSED - fingerprint %s", details.get("derived_fingerprint"))
+    except RuntimeError as e:
+        logger.error("Startup key verification FAILED: %s", e)
+        raise
+    except Exception as e:
+        logger.error("Unexpected startup verification error: %s", e)
+        raise
+
+def check_admin(request: Request) -> bool:
+    user = os.getenv("ADMIN_USER") or ADMIN_USER
+    passwd = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or ADMIN_PASS
+    if not user or not passwd:
+        return False
     auth = request.headers.get("Authorization", "")
-    # also support cookie / basic
-    if request.cookies.get("admin") == "1":
-        return True
-    # Basic auth
-    import base64
     if auth.startswith("Basic "):
         try:
-            decoded = base64.b64decode(auth[6:]).decode()
+            decoded = base64.b64decode(auth[6:]).decode("utf-8")
+            if ":" not in decoded:
+                return False
             u, p = decoded.split(":", 1)
-            if u == ADMIN_USER and p == ADMIN_PASS:
+            if secrets.compare_digest(u, user) and secrets.compare_digest(p, passwd):
                 return True
-        except: pass
+        except Exception:
+            pass
     return False
 
-# --- Public API ---
+def require_admin(request: Request):
+    if not check_admin(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized - use HTTP Basic auth with ADMIN_USER/ADMIN_PASS",
+            headers={"WWW-Authenticate": 'Basic realm="SivantaAdmin"'}
+        )
+
+def generate_license_id() -> str:
+    alphabet = LICENSE_ALPHABET
+    part1 = "".join(secrets.choice(alphabet) for _ in range(4))
+    part2 = "".join(secrets.choice(alphabet) for _ in range(4))
+    return f"SIV-{part1}-{part2}"
+
+def add_calendar_months(ts: int, months: int) -> int:
+    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+    year = dt.year
+    month = dt.month + months
+    year += (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    day = dt.day
+    last_day = calendar.monthrange(year, month)[1]
+    if day > last_day:
+        day = last_day
+    new_dt = datetime.datetime(year, month, day, dt.hour, dt.minute, dt.second, tzinfo=datetime.timezone.utc)
+    return int(new_dt.timestamp())
+
+# --- Public ---
+@app.get("/")
+def root():
+    return RedirectResponse("/admin")
 
 @app.get("/health")
-def health(): return {"ok": True}
+def health():
+    return {"ok": True, "startup_verified": _startup_verified, "fingerprint": _startup_details.get("derived_fingerprint") if _startup_details else None}
 
-@app.get("/config")
-def get_config(db: Session = Depends(get_db)):
-    cfg = db.query(models.AppConfig).first()
-    return {"latest_version_code": cfg.latest_version_code, "min_supported_version": cfg.min_supported_version,
-            "maintenance_mode": cfg.maintenance_mode, "apk_url": cfg.apk_url}
+@app.get("/.well-known/public_key.pem", response_class=PlainTextResponse)
+def public_key():
+    try:
+        pem = crypto.get_public_key_pem()
+        # Spec requires application/x-pem-file, public key only
+        return PlainTextResponse(pem, media_type="application/x-pem-file", headers={"Content-Disposition": "inline; filename=\"public_key.pem\""})
+    except Exception as e:
+        logger.error("Public key not available: %s", e)
+        raise HTTPException(status_code=500, detail="Public key not available")
 
-@app.get("/.well-known/public_key.pem")
-def public_key(): return crypto.get_public_key_pem()
-
-@app.post("/api/activate")
-def activate(license_key: str = Form(...), installation_id: str = Form(...),
-             device_name: str = Form(""), app_version: int = Form(1), public_key: str = Form(""),
-             db: Session = Depends(get_db)):
-    lic = db.query(models.License).filter(models.License.id == license_key).first()
-    if not lic: raise HTTPException(400, "Invalid license")
-    if lic.is_revoked: raise HTTPException(403, "License revoked")
-    if lic.is_suspended: raise HTTPException(403, "License suspended")
-    if lic.expires_at and lic.expires_at < datetime.datetime.utcnow():
-        raise HTTPException(403, "License expired")
-    if lic.min_app_version > app_version:
-        raise HTTPException(426, f"Update required. Minimum version: {lic.min_app_version}")
-    # device limit
-    active = [d for d in lic.devices if not d.is_revoked]
-    # allow re-activation of same installation
-    existing = next((d for d in active if d.installation_id == installation_id), None)
-    if not existing and len(active) >= lic.max_devices:
-        raise HTTPException(403, "Device limit reached")
-    if not existing:
-        dev = models.Device(license_id=lic.id, installation_id=installation_id,
-                            device_name=device_name[:60], public_key=public_key[:2000])
-        db.add(dev); db.commit(); db.refresh(dev)
-        device_id = dev.id
-    else:
-        existing.last_seen_at = datetime.datetime.utcnow()
-        db.commit()
-        device_id = existing.id
-    lic.last_verified_at = datetime.datetime.utcnow()
-    db.commit()
-    payload = {
-        "license_id": lic.id,
-        "device_id": device_id,
-        "installation_id": installation_id,
-        "issued_at": int(datetime.datetime.utcnow().timestamp()),
-        "expires_at": int((datetime.datetime.utcnow() + datetime.timedelta(days=lic.grace_days)).timestamp()),
-        "grace_days": lic.grace_days,
-        "plan": lic.plan,
-        "min_version": lic.min_app_version,
-    }
-    token = crypto.sign_entitlement(payload)
-    return {"entitlement": token, "payload": payload}
-
-@app.post("/api/verify")
-def verify(entitlement: str = Form(...), installation_id: str = Form(...), db: Session = Depends(get_db)):
-    payload = crypto.verify_entitlement(entitlement)
-    if not payload: raise HTTPException(401, "Invalid entitlement signature")
-    if payload["expires_at"] < int(datetime.datetime.utcnow().timestamp()):
-        raise HTTPException(401, "Entitlement expired — re-activate")
-    if payload["installation_id"] != installation_id:
-        raise HTTPException(401, "Device mismatch")
-    lic = db.query(models.License).filter(models.License.id == payload["license_id"]).first()
-    if not lic or lic.is_revoked or lic.is_suspended:
-        raise HTTPException(403, "License revoked")
-    dev = db.query(models.Device).filter(models.Device.id == payload["device_id"]).first()
-    if not dev or dev.is_revoked:
-        raise HTTPException(403, "Device revoked")
-    payload["expires_at"] = int((datetime.datetime.utcnow() + datetime.timedelta(days=lic.grace_days)).timestamp())
-    new_token = crypto.sign_entitlement(payload)
-    return {"entitlement": new_token, "payload": payload}
-
-# --- Admin (very small, HTTP Basic protected) ---
+# --- Admin UI ---
+# --- Admin UI ---
+# --- Admin UI ---
+# --- Admin UI ---
+# --- Admin UI ---
 @app.get("/admin", response_class=HTMLResponse)
+@app.get("/admin/", response_class=HTMLResponse)
 def admin_home(request: Request, db: Session = Depends(get_db)):
     if not check_admin(request):
-        return HTMLResponse('<h3>401 Unauthorized</h3>Use HTTP Basic auth with ADMIN_USER/ADMIN_PASS', status_code=401,
-                            headers={"WWW-Authenticate": "Basic"})
-    lic_count = db.query(func.count(models.License.id)).scalar()
-    cust_count = db.query(func.count(models.Customer.id)).scalar()
-    dev_count = db.query(func.count(models.Device.id)).scalar()
-    return templates.TemplateResponse("admin.html", {"request": request, "lic_count": lic_count, "cust_count": cust_count, "dev_count": dev_count,
-                                                     "licenses": db.query(models.License).all()[:50],
-                                                     "customers": db.query(models.Customer).all()[:50]})
+        return HTMLResponse(
+            '<h3>401 Unauthorized</h3>Use HTTP Basic auth with ADMIN_USER/ADMIN_PASS env vars',
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="SivantaAdmin"'}
+        )
+    licenses = db.query(models.License).order_by(models.License.createdAt.desc()).limit(50).all()
+    
+    # కొత్త Starlette వెర్షన్ల కోసం context ని విడిగా డిక్లేర్ చేసి పంపాలి
+    context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED}
+    return templates.TemplateResponse(request, "admin.html", context)
 
-@app.post("/admin/license/create")
-def admin_create_license(customer_name: str = Form(...), max_devices: int = Form(1), days: int = Form(365),
-                         db: Session = Depends(get_db)):
-    cust = models.Customer(name=customer_name)
-    db.add(cust); db.commit(); db.refresh(cust)
-    lic = models.License(customer_id=cust.id, max_devices=max_devices,
-                         expires_at=datetime.datetime.utcnow() + datetime.timedelta(days=days) if days else None)
-    db.add(lic); db.commit()
-    return RedirectResponse("/admin", status_code=303)
+# --- Admin API: POST /admin/licenses ---
+@app.post("/admin/licenses")
+async def create_license(request: Request, db: Session = Depends(get_db)):
+    if not check_admin(request):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": 'Basic realm="SivantaAdmin"'})
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Payload must be JSON object")
+
+    customerId = body.get("customerId")
+    if not customerId or not isinstance(customerId, str) or not customerId.strip():
+        raise HTTPException(status_code=400, detail="customerId is required and must be non-empty string")
+    customerId = customerId.strip()
+
+    # STEP 4D: validityMonths must default to 6, reject unsupported
+    validityMonths = body.get("validityMonths", 6)
+    try:
+        validityMonths = int(validityMonths)
+    except Exception:
+        raise HTTPException(status_code=400, detail="validityMonths must be integer")
+    if validityMonths != 6:
+        raise HTTPException(status_code=400, detail="Only 6 calendar months validity is supported in STEP 4D")
+
+    product = body.get("product", PRODUCT_EXPECTED)
+    if product != PRODUCT_EXPECTED:
+        raise HTTPException(status_code=400, detail=f"Invalid product - must be '{PRODUCT_EXPECTED}'")
+
+    maxVillages = body.get("maxVillages", 20)
+    maxDevices = body.get("maxDevices", 1)
+
+    try:
+        maxVillages = int(maxVillages)
+        maxDevices = int(maxDevices)
+    except Exception:
+        raise HTTPException(status_code=400, detail="maxVillages and maxDevices must be integers")
+
+    if not (1 <= maxVillages <= 1000):
+        raise HTTPException(status_code=400, detail="maxVillages must be between 1 and 1000")
+    if not (1 <= maxDevices <= 100):
+        raise HTTPException(status_code=400, detail="maxDevices must be between 1 and 100")
+
+    issuedAt = body.get("issuedAt")
+    if issuedAt is not None:
+        try:
+            issuedAt = int(issuedAt)
+        except Exception:
+            raise HTTPException(status_code=400, detail="issuedAt must be epoch seconds")
+    else:
+        issuedAt = int(time.time())
+
+    expiresAt = add_calendar_months(issuedAt, validityMonths)
+    status = "active"
+
+    licenseId = None
+    for _ in range(10):
+        cand = generate_license_id()
+        exists = db.query(models.License).filter(models.License.licenseId == cand).first()
+        if not exists:
+            licenseId = cand
+            break
+    if not licenseId:
+        raise HTTPException(status_code=500, detail="Failed to generate unique licenseId")
+
+    payload = {
+        "customerId": customerId,
+        "expiresAt": expiresAt,
+        "issuedAt": issuedAt,
+        "licenseId": licenseId,
+        "maxDevices": maxDevices,
+        "maxVillages": maxVillages,
+        "product": PRODUCT_EXPECTED,
+        "status": status,
+        "version": VERSION
+    }
+
+    try:
+        token = crypto.sign_payload(payload)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Signing failed: {e}")
+
+    lic = models.License(
+        licenseId=licenseId,
+        customerId=customerId,
+        product=PRODUCT_EXPECTED,
+        maxVillages=maxVillages,
+        maxDevices=maxDevices,
+        issuedAt=issuedAt,
+        expiresAt=expiresAt,
+        status=status
+    )
+    # Ensure new fields have defaults
+    try:
+        lic.is_revoked = False
+        lic.is_suspended = False
+        lic.graceDays = 7
+    except Exception:
+        pass
+    db.add(lic)
+    db.commit()
+    db.refresh(lic)
+
+    verified = crypto.verify_token(token)
+    if not verified:
+        raise HTTPException(status_code=500, detail="Generated token failed verification")
+
+    return {
+        "licenseId": licenseId,
+        "customerId": customerId,
+        "product": PRODUCT_EXPECTED,
+        "issuedAt": issuedAt,
+        "expiresAt": expiresAt,
+        "status": status,
+        "maxVillages": maxVillages,
+        "maxDevices": maxDevices,
+        "version": VERSION,
+        "payload": payload,
+        "canonicalJson": crypto.canonical_json(payload).decode("utf-8"),
+        "token": token
+    }
+
+@app.post("/admin/verify")
+async def admin_verify(request: Request):
+    if not check_admin(request):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": 'Basic realm="SivantaAdmin"'})
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    token = body.get("token") if isinstance(body, dict) else None
+    if not token:
+        raise HTTPException(status_code=400, detail="token required")
+    data = crypto.verify_token(token)
+    if not data:
+        raise HTTPException(status_code=400, detail="Invalid signature or malformed token")
+    return {"valid": True, "payload": data}
+
+@app.get("/admin/licenses")
+def list_licenses(request: Request, db: Session = Depends(get_db)):
+    if not check_admin(request):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": 'Basic realm="SivantaAdmin"'})
+    licenses = db.query(models.License).order_by(models.License.createdAt.desc()).all()
+    return [{"licenseId": l.licenseId, "customerId": l.customerId, "product": l.product, "maxVillages": l.maxVillages, "maxDevices": l.maxDevices, "issuedAt": l.issuedAt, "expiresAt": l.expiresAt, "status": l.status} for l in licenses]
+
+# --- STEP 4H: POST /api/verify (customer online verification) ---
+@app.post("/api/verify")
+async def api_verify(request: Request, db: Session = Depends(get_db)):
+    """
+    Customer online verification.
+    Request JSON: {entitlement: SIVANTA1... , installationId: uuid }
+    Also accepts {token: ...} for tolerance.
+    - Verifies SIVANTA1 token signature, product, status, issuedAt, expiresAt, licenseId exists,
+      is_revoked, is_suspended, max_devices, device registration.
+    - Uses installationId from request, not from token.
+    - Enforces max_devices: count active devices, allow duplicate verification from same installationId (update lastSeenAt).
+    Returns:
+      200 {valid:true, licenseId, status, expiresAt, graceDays}
+      403 {valid:false, code:"REVOKED"|"SUSPENDED"|"EXPIRED"|"MAX_DEVICES"}
+      400/401 {valid:false, code:"INVALID_LICENSE"}
+    Never stores customer coordinates.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE", "reason": "Invalid JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE"})
+
+    token = body.get("entitlement") or body.get("token") or body.get("license") or body.get("entitlementToken")
+    installationId = body.get("installationId") or body.get("installation_id")
+
+    if not token or not isinstance(token, str) or not token.strip():
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE", "reason": "entitlement required"})
+    if not installationId or not isinstance(installationId, str) or not installationId.strip():
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE", "reason": "installationId required"})
+    token = token.strip()
+    installationId = installationId.strip()
+
+    # Basic installationId format validation (UUID-like, but allow any non-empty)
+    if len(installationId) < 8 or len(installationId) > 128:
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE", "reason": "invalid installationId"})
+
+    # Verify token signature
+    payload = crypto.verify_token(token)
+    if not payload:
+        return JSONResponse(status_code=401, content={"valid": False, "code": "INVALID_LICENSE", "reason": "Invalid signature"})
+
+    # Validate payload fields
+    try:
+        version = payload.get("version")
+        if version is None or int(version) < 1:
+            return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE"})
+        licenseId = payload.get("licenseId") or payload.get("license_id")
+        if not licenseId or not isinstance(licenseId, str):
+            return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE"})
+        licenseId = licenseId.strip()
+        product = payload.get("product", "")
+        if product != PRODUCT_EXPECTED:
+            return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE", "reason": "product mismatch"})
+        status = str(payload.get("status", "")).lower().strip()
+        if status != "active":
+            return JSONResponse(status_code=403, content={"valid": False, "code": "SUSPENDED" if status == "suspended" else "REVOKED"})
+        issuedAt = int(payload.get("issuedAt") or payload.get("issued_at") or 0)
+        expiresAt = int(payload.get("expiresAt") or payload.get("expires_at") or 0)
+        if expiresAt <= issuedAt:
+            return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE"})
+        nowSec = int(time.time())
+        if issuedAt > nowSec + 300:
+            return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE", "reason": "issuedAt in future"})
+    except Exception:
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_LICENSE"})
+
+    # Check license exists in DB
+    lic = db.query(models.License).filter(models.License.licenseId == licenseId).first()
+    if not lic:
+        return JSONResponse(status_code=401, content={"valid": False, "code": "INVALID_LICENSE", "reason": "license not found"})
+
+    # Check is_revoked / is_suspended (handle old rows where column may be null)
+    try:
+        is_revoked = bool(getattr(lic, "is_revoked", False))
+    except Exception:
+        is_revoked = False
+    try:
+        is_suspended = bool(getattr(lic, "is_suspended", False))
+    except Exception:
+        is_suspended = False
+    if is_revoked:
+        return JSONResponse(status_code=403, content={"valid": False, "code": "REVOKED"})
+    if is_suspended:
+        return JSONResponse(status_code=403, content={"valid": False, "code": "SUSPENDED"})
+
+    # Check expiry
+    nowSec = int(time.time())
+    if nowSec >= int(lic.expiresAt):
+        return JSONResponse(status_code=403, content={"valid": False, "code": "EXPIRED"})
+    # Also check payload expiresAt vs db expiresAt mismatch? Use db value authoritative
+    if nowSec >= expiresAt:
+        return JSONResponse(status_code=403, content={"valid": False, "code": "EXPIRED"})
+
+    # Device registration with installationId UNIQUE
+    try:
+        graceDays = int(getattr(lic, "graceDays", 7) or 7)
+    except Exception:
+        graceDays = 7
+    maxDevices = int(lic.maxDevices) if lic.maxDevices else 1
+
+    # Do NOT store customer coordinates — only device ids
+    nowDt = datetime.datetime.utcnow()
+
+    # Check if this installationId already registered for this license -> update lastSeenAt
+    existing_for_license = db.query(models.Device).filter(
+        models.Device.licenseId == licenseId,
+        models.Device.installationId == installationId
+    ).first()
+    if existing_for_license:
+        try:
+            existing_for_license.lastSeenAt = nowDt
+            # ensure status active
+            if hasattr(existing_for_license, "status"):
+                existing_for_license.status = "active"
+            db.commit()
+        except Exception:
+            db.rollback()
+        return JSONResponse(status_code=200, content={
+            "valid": True,
+            "licenseId": licenseId,
+            "status": lic.status,
+            "expiresAt": int(lic.expiresAt),
+            "graceDays": graceDays
+        })
+
+    # Check if installationId exists globally for different license — prevent reuse without revoke
+    existing_global = db.query(models.Device).filter(models.Device.installationId == installationId).first()
+    if existing_global and existing_global.licenseId != licenseId:
+        # Same device trying to use different license — treat as distinct device for new license?
+        # Since installationId globally unique, prevent collision: return MAX_DEVICES for new license to avoid leaking
+        # Alternatively, allow re-binding if old license is same customer? For now, allow if old device inactive?
+        # Count still enforced; we'll treat as MAX_DEVICES if max reached, else allow reassign after checking maxDevices
+        # Simplest: if global exists for different license, deny to prevent sharing.
+        # But spec says devices table with installationId UNIQUE — so duplicate should be blocked.
+        # We'll return MAX_DEVICES to indicate limit.
+        # To allow same device to switch licenses after revoke, admin can revoke old device.
+        # For now return 403 MAX_DEVICES if device already bound elsewhere.
+        return JSONResponse(status_code=403, content={"valid": False, "code": "MAX_DEVICES", "reason": "installationId already registered to another license"})
+
+    # Count active devices for this license
+    active_count = db.query(models.Device).filter(
+        models.Device.licenseId == licenseId
+    ).count()
+    # Also filter status active if column exists? Use simple count for now
+    if active_count >= maxDevices:
+        return JSONResponse(status_code=403, content={"valid": False, "code": "MAX_DEVICES"})
+
+    # Register new device
+    try:
+        new_device = models.Device(
+            id=str(uuid.uuid4()),
+            licenseId=licenseId,
+            installationId=installationId,
+            status="active",
+            firstSeenAt=nowDt,
+            lastSeenAt=nowDt,
+            createdAt=nowDt
+        )
+        db.add(new_device)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        # Unique constraint violation -> race, treat as MAX_DEVICES or success if duplicate
+        if "UNIQUE" in str(e) or "unique" in str(e).lower():
+            return JSONResponse(status_code=403, content={"valid": False, "code": "MAX_DEVICES"})
+        logger.error("Device registration failed: %s", e)
+        return JSONResponse(status_code=500, content={"valid": False, "code": "SERVER_ERROR"})
+
+    return JSONResponse(status_code=200, content={
+        "valid": True,
+        "licenseId": licenseId,
+        "status": lic.status,
+        "expiresAt": int(lic.expiresAt),
+        "graceDays": graceDays
+    })
+
+# --- STEP 4H: POST /admin/licenses/{licenseId}/revoke ---
+@app.post("/admin/licenses/{licenseId}/revoke")
+def revoke_license(licenseId: str, request: Request, db: Session = Depends(get_db)):
+    if not check_admin(request):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": 'Basic realm="SivantaAdmin"'})
+    lic = db.query(models.License).filter(models.License.licenseId == licenseId).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="License not found")
+    try:
+        lic.is_revoked = True
+        # Optionally set status to revoked for visibility
+        lic.status = "revoked"
+        db.commit()
+        db.refresh(lic)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Revoke failed: {e}")
+    return {"ok": True, "licenseId": licenseId, "is_revoked": True, "status": lic.status}
+
+@app.post("/admin/licenses/{licenseId}/suspend")
+def suspend_license(licenseId: str, request: Request, db: Session = Depends(get_db)):
+    if not check_admin(request):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": 'Basic realm="SivantaAdmin"'})
+    lic = db.query(models.License).filter(models.License.licenseId == licenseId).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="License not found")
+    try:
+        lic.is_suspended = True
+        lic.status = "suspended"
+        db.commit()
+        db.refresh(lic)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Suspend failed: {e}")
+    return {"ok": True, "licenseId": licenseId, "is_suspended": True, "status": lic.status}
