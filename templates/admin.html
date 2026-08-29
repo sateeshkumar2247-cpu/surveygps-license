@@ -1,18 +1,146 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>SivantaAdmin License Server - STEP 4C</title>
-<style>body{font-family:system-ui,Segoe UI,Roboto,sans-serif;padding:24px;max-width:900px;margin:auto;background:#fafafa}header{background:#1B4332;color:#fff;padding:16px;border-radius:8px}table{border-collapse:collapse;width:100%;margin-top:16px}th,td{border:1px solid #ccc;padding:6px 8px;text-align:left}th{background:#2D6A4F;color:#fff}input,button{padding:6px 10px;margin:4px}code{background:#eee;padding:2px 6px;border-radius:4px}pre{white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid #ddd;padding:12px;border-radius:6px}</style>
-</head><body>
-<header><h2>SivantaAdmin — License Server (STEP 4C)</h2><p style="margin:0;opacity:.9">Dedicated license server • Ed25519 • SIVANTA1.*.* • 6 calendar months</p></header>
-<p style="color:#666;font-size:13px">Auth: HTTP Basic <code>ADMIN_USER</code>/<code>ADMIN_PASS</code> env vars (also accepts <code>ADMIN_PASSWORD</code>). Public key: <a href="/.well-known/public_key.pem">/.well-known/public_key.pem</a></p>
-<h3>Issue License (POST /admin/licenses)</h3>
-<p style="font-size:13px;color:#555">Example: <code>curl -u $ADMIN_USER:$ADMIN_PASS -X POST -H "Content-Type: application/json" -d "{\"customerId\":\"CUST001\",\"maxVillages\":20,\"maxDevices\":1}" https://your-server/admin/licenses</code></p>
-<h3>Recent Licenses ({{licenses|length}})</h3>
-<table><tr><th>License ID</th><th>Customer</th><th>Villages</th><th>Devices</th><th>Issued</th><th>Expires</th><th>Status</th></tr>
-{% for l in licenses %}
-<tr><td><code>{{l.licenseId}}</code></td><td>{{l.customerId}}</td><td>{{l.maxVillages}}</td><td>{{l.maxDevices}}</td><td>{{l.issuedAt}}</td><td>{{l.expiresAt}}</td><td>{{l.status}}</td></tr>
+<html><head><meta charset="utf-8"><title>SivantaAdmin License Server</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,sans-serif;padding:24px;max-width:900px;margin:auto;background:#fafafa}
+header{background:#1B4332;color:#fff;padding:16px;border-radius:8x;margin-bottom:24px}
+h1{margin:0}.form-row{margin-bottom:12px}.field{margin-bottom:12px}
+label{display:block;margin-bottom:4px;font-weight:500}
+input,select,button{padding:8px 12px;margin:4px;font-size:16px}
+button{background:#1B4332;color:#fff;border:none;border-radius:4px;cursor:pointer}
+button:hover{background:#2E6B34}
+button:disabled{background:#666;cursor:not-allowed}
+.code-display{background:#f0f0f0;border:1px solid #ddd;border-radius:4px;padding:12px;margin:12px 0;font-family:monospace;font-size:20px;min-height:36px;word-break:break-all}
+.copy-btn{background:#2E6B34;margin-top:8px}
+.success-panel{background:#E8F5E9;border:1px solid #1B4332;border-radius:8px;padding:24px;margin-top:24px;display:none}
+.success-panel.show{display:block}
+.copy-toast{position:fixed;bottom:24right:24;background:#1B4332;color:#fff;padding:12px;border-radius:4px;display:none;z-index:9999}
+</style>
+</head>
+<body>
+<header>
+<h1>Sivanta License Generator</h1>
+<p style="margin:0;opacity:.9">Ed25519 • SIVANTA1.*.* • 10-digit activation code</p>
+</header>
+
+{% if error %}
+<div style="background:#FFEBEE;border:1px solid:#EF9A9A;border-radius:4px;padding:12px;margin-bottom:24px;color:#C62828;">
+  <strong>Login failed:</strong> {{ error }}
+  <br><a href="/admin">Try again</a>
+</div>
+{% endif %}
+
+{% if not show_generator %}
+<!-- Login form -->
+<div class="form-row">
+  <h2>Admin Login</h2>
+  <form method="POST" action="/admin/login">
+    <div class="field">
+      <label>Admin Username</label>
+      <input type="text" name="username" required autocomplete="username" value="{{ form_username }}">
+    </div>
+    <div class="field">
+      <label>Admin Password</label>
+      <input type="password" name="password" required autocomplete="current-password">
+    </div>
+    <button type="submit">Login</button>
+  </form>
+</div>
 {% else %}
-<tr><td colspan="7" style="color:#888;text-align:center">No licenses yet</td></tr>
-{% endfor %}
-</table>
-<p style="color:#666;font-size:13px">Product: <code>{{product}}</code> • Token format: <code>SIVANTA1.&lt;base64url(canonical-json)&gt;.&lt;base64url(ed25519-signature)&gt;</code></p>
+<!-- Logged in: generator form + results area -->
+<div class="form-row">
+  <h2>License Generator</h2>
+  <p style="font-size:13px;color:#555">Auth: using credentials above • Product: <code>{{ product }}</code></p>
+</div>
+
+<form id="genForm" method="POST" action="/admin">
+  <div class="field">
+    <label>Customer ID</label>
+    <input type="text" name="customerId" required autocomplete="off" placeholder="e.g. STEP4I-LIVE-TEST">
+  </div>
+
+  <div class="field">
+    <label>Max Villages</label>
+    <input type="number" name="maxVillages" value="20" min="1" max="1000" required autocomplete="off">
+  </div>
+
+  <div class="field">
+    <label>Max Devices</label>
+    <input type="number" name="maxDevices" value="1" min="1" max="100" required autocomplete="off">
+  </div>
+
+  <div class="field">
+    <label>Validity Type</label>
+    <select name="validityType" onchange="updateValidityField()">
+      <option value="days">Days</option>
+      <option value="months">Months</option>
+    </select>
+  </div>
+
+  <div class="field">
+    <label>Validity</label>
+    <input type="number" name="validityValue" id="validityValue" value="30" min="1" max="3650" required autocomplete="off">
+  </div>
+
+  <div class="field" style="grid-column: 1 / -1;">
+    <button type="submit" name="createLicense">CREATE LICENSE</button>
+  </div>
+</div>
+</form>
+
+{% if createdLicense %}
+<div class="success-panel" id="successPanel">
+  <h3>LICENSE CREATED ✓</h3>
+  <p><strong>License ID:</strong> {{ createdLicense.licenseId }}</p>
+  <p><strong>Activation Code:</strong> <span id="activationCodeDisplay" class="code-display">{{ createdLicense.activationCode }}</span></p>
+  <p><strong>Validity:</strong> {{ createdLicense.validityLabel }}</p>
+  <p><strong>Max Villages:</strong> {{ createdLicense.maxVillages }}</p>
+  <p><strong>Max Devices:</strong> {{ createdLicense.maxDevices }}</p>
+  <p><strong>Issued:</strong> {{ createdLicense.issuedAtLabel }}</p>
+  <p><strong>Expires:</strong> {{ createdLicense.expiresAtLabel }}</p>
+
+  <div style="margin-top:20px">
+    <button class="copy-btn" onclick="copyActivationCode()">COPY ACTIVATION CODE</button>
+    <button class="copy-btn" onclick="copyLicenseID()">COPY LICENSE ID</button>
+  </div>
+
+  <div class="copy-toast" id="copyToast">Copied to clipboard</div>
+</div>
+{% endif %}
+
+<script>
+function updateValidityField() {
+  const type = document.querySelector('select[name="validityType"]').value;
+  const field = document.getElementById('validityValue');
+  if (type === 'days') {
+    field.min = 1;
+    field.max = 3650;
+    field.placeholder = '1-3650';
+    field.value = Math.min((field.value || 30), 3650);
+  } else {
+    field.min = 1;
+    field.max = 12;
+    field.placeholder = '1-12';
+    field.value = Math.min((field.value || 6), 12);
+  }
+}
+
+function copyActivationCode() {
+  const code = document.getElementById('activationCodeDisplay').innerText.trim();
+  navigator.clipboard.writeText(code).then(() => showToast());
+}
+
+function copyLicenseID() {
+  const code = "{{ createdLicense.licenseId }}";
+  navigator.clipboard.writeText(code).then(() => showToast());
+}
+
+function showToast() {
+  const toast = document.getElementById('copyToast');
+  toast.style.display = 'block';
+  setTimeout(() => toast.style.display = 'none', 2000);
+}
+
+// Initialize validity field on page load
+updateValidityField();
+</script>
 </body></html>
