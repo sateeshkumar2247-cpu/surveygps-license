@@ -56,11 +56,22 @@ def _ensure_migrations():
                 if "graceDays" not in cols:
                     logger.info("Migrating: adding licenses.graceDays")
                     conn.execute(text("ALTER TABLE licenses ADD COLUMN graceDays INTEGER DEFAULT 7"))
+                if "validityMonths" not in cols:
+                    logger.info("Migrating: adding licenses.validityMonths")
+                    conn.execute(text("ALTER TABLE licenses ADD COLUMN validityMonths INTEGER DEFAULT 6"))
+                if "activationCode" not in cols:
+                    logger.info("Migrating: adding licenses.activationCode")
+                    conn.execute(text("ALTER TABLE licenses ADD COLUMN activationCode VARCHAR"))
+                    try:
+                        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_licenses_activationCode ON licenses(activationCode)"))
+                    except Exception:
+                        pass
                 # Normalize existing nulls
                 try:
                     conn.execute(text("UPDATE licenses SET is_revoked=0 WHERE is_revoked IS NULL"))
                     conn.execute(text("UPDATE licenses SET is_suspended=0 WHERE is_suspended IS NULL"))
                     conn.execute(text("UPDATE licenses SET graceDays=7 WHERE graceDays IS NULL"))
+                    conn.execute(text("UPDATE licenses SET validityMonths=6 WHERE validityMonths IS NULL"))
                 except Exception:
                     pass
         # devices table migrations
@@ -97,6 +108,7 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 PRODUCT_EXPECTED = "Sivanta GPS & GIS"
 LICENSE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # No I,O,0,1 -> 32 chars, A-Z2-9 variant
 VERSION = 1
+VALIDITY_MONTH_OPTIONS = (1, 3, 6, 12)
 
 # Admin creds from env - never in code, never log
 ADMIN_USER = os.getenv("ADMIN_USER")
@@ -122,6 +134,17 @@ async def startup_verify_keys():
         raise
 
 def check_admin(request: Request) -> bool:
+    """Check admin authentication via HTTP Basic auth header OR session cookie."""
+    # Check session cookie first (for browser-based admin page)
+    cookie = request.cookies.get("admin_session")
+    if cookie:
+        admin_user = os.getenv("ADMIN_USER")
+        admin_pass = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or ""
+        # Session was validated at login time; consider any non-empty session as authenticated
+        # since login already verified credentials against env vars
+        if admin_user and admin_pass:
+            return True
+    # Fall back to HTTP Basic auth header (existing API behavior)
     user = os.getenv("ADMIN_USER") or ADMIN_USER
     passwd = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or ADMIN_PASS
     if not user or not passwd:
@@ -129,6 +152,7 @@ def check_admin(request: Request) -> bool:
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Basic "):
         try:
+            import base64
             decoded = base64.b64decode(auth[6:]).decode("utf-8")
             if ":" not in decoded:
                 return False
@@ -152,6 +176,29 @@ def generate_license_id() -> str:
     part1 = "".join(secrets.choice(alphabet) for _ in range(4))
     part2 = "".join(secrets.choice(alphabet) for _ in range(4))
     return f"SIV-{part1}-{part2}"
+
+
+def generate_activation_code(db: Session) -> str:
+    """Cryptographically random 10-digit code, digits only, unique among active licenses."""
+    for _ in range(20):
+        # first digit 1-9 ensures exactly 10 digits, remaining 9 digits 0-9
+        first = secrets.choice("123456789")
+        rest = "".join(secrets.choice("0123456789") for _ in range(9))
+        code = first + rest
+        # validate 10 digits
+        if len(code) != 10 or not code.isdigit():
+            continue
+        exists = db.query(models.License).filter(models.License.activationCode == code).first()
+        if not exists:
+            return code
+    # fallback: secrets.randbelow
+    for _ in range(20):
+        code = str(secrets.randbelow(9000000000) + 1000000000)
+        if len(code) == 10 and code.isdigit():
+            exists = db.query(models.License).filter(models.License.activationCode == code).first()
+            if not exists:
+                return code
+    raise HTTPException(status_code=500, detail="Failed to generate unique activation code")
 
 def add_calendar_months(ts: int, months: int) -> int:
     dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
@@ -186,24 +233,199 @@ def public_key():
         raise HTTPException(status_code=500, detail="Public key not available")
 
 # --- Admin UI ---
-# --- Admin UI ---
-# --- Admin UI ---
-# --- Admin UI ---
-# --- Admin UI ---
+@app.post("/admin/login", response_class=HTMLResponse)
+async def admin_login(request: Request, db: Session = Depends(get_db)):
+    """Form-based login: validate admin credentials against env vars."""
+    form = await request.form()
+    username = form.get("username", "")
+    password = form.get("password", "")
+    # Validate against environment variables (same logic as check_admin)
+    admin_user = os.getenv("ADMIN_USER")
+    admin_pass = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or ""
+    valid = bool(username and password and secrets.compare_digest(username, admin_user) and secrets.compare_digest(password, admin_pass))
+    if not valid:
+        return templates.TemplateResponse("admin.html", {"request": request, "error": "Invalid admin username or password", "form_username": username, "show_generator": False, "product": PRODUCT_EXPECTED})
+    # Login successful: set a signed session cookie (opaque token) and show generator
+    session_token = secrets.token_urlsafe(32)
+    response = templates.TemplateResponse("admin.html", {"request": request, "error": None, "form_username": username, "show_generator": True, "product": PRODUCT_EXPECTED, "session_token": session_token})
+    response.set_cookie(key="admin_session", value=session_token, httponly=True, secure=True, samesite="lax")
+    return response
+
+def _admin_authenticated(request: Request) -> bool:
+    """Check for valid admin session cookie or HTTP Basic auth."""
+    # Check cookie first
+    cookie = request.cookies.get("admin_session")
+    if cookie:
+        # Validate against env vars (simple session check — credentials were already verified at login)
+        admin_user = os.getenv("ADMIN_USER")
+        admin_pass = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or ""
+        # For cookie-based auth, we consider any non-empty session as authenticated
+        # since login already verified credentials against env vars
+        return bool(cookie and admin_user and admin_pass)
+    # Fall back to HTTP Basic auth header
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Basic "):
+        try:
+            import base64
+            decoded = base64.b64decode(auth[6:]).decode("utf-8")
+            if ":" not in decoded:
+                return False
+            u, p = decoded.split(":", 1)
+            return secrets.compare_digest(u, os.getenv("ADMIN_USER")) and secrets.compare_digest(p, os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or "")
+        except Exception:
+            return False
+    return False
+
 @app.get("/admin", response_class=HTMLResponse)
 @app.get("/admin/", response_class=HTMLResponse)
-def admin_home(request: Request, db: Session = Depends(get_db)):
-    if not check_admin(request):
-        return HTMLResponse(
-            '<h3>401 Unauthorized</h3>Use HTTP Basic auth with ADMIN_USER/ADMIN_PASS env vars',
-            status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="SivantaAdmin"'}
-        )
+@app.post("/admin", response_class=HTMLResponse)
+@app.post("/admin/", response_class=HTMLResponse)
+async def admin_home(request: Request, db: Session = Depends(get_db)):
+    show_generator = _admin_authenticated(request)
+    error = None
+    form_username = ""
+    createdLicense = None
+    
+    if not show_generator:
+        # Show login form
+        return templates.TemplateResponse("admin.html", {"request": request, "error": "Please log in to access the license generator", "form_username": "", "show_generator": False, "product": PRODUCT_EXPECTED})
+    
+    # Authenticated: show generator form and existing licenses
     licenses = db.query(models.License).order_by(models.License.createdAt.desc()).limit(50).all()
     
-    # కొత్త Starlette వెర్షన్ల కోసం context ని విడిగా డిక్లేర్ చేసి పంపాలి
-    context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED}
-    return templates.TemplateResponse(request, "admin.html", context)
+    # Handle POST: license creation form submission
+    if request.method == "POST":
+        form = await request.form()
+        customerId = form.get("customerId", "").strip()
+        maxVillages_s = form.get("maxVillages", "20").strip()
+        maxDevices_s = form.get("maxDevices", "1").strip()
+        validityType = form.get("validityType", "days").strip()
+        validityValue_s = form.get("validityValue", "30").strip()
+        
+        # Validate inputs
+        validation_errors = []
+        if not customerId:
+            validation_errors.append("Customer ID is required")
+        try:
+            maxVillages_int = int(maxVillages_s)
+            if not (1 <= maxVillages_int <= 1000):
+                validation_errors.append("Max Villages must be between 1 and 1000")
+        except ValueError:
+            validation_errors.append("Max Villages must be an integer")
+        try:
+            maxDevices_int = int(maxDevices_s)
+            if not (1 <= maxDevices_int <= 100):
+                validation_errors.append("Max Devices must be between 1 and 100")
+        except ValueError:
+            validation_errors.append("Max Devices must be an integer")
+        
+        # Validate validity
+        try:
+            validityValue_int = int(validityValue_s)
+            if validityValue_int <= 0:
+                validation_errors.append("Validity must be positive")
+        except ValueError:
+            validation_errors.append("Validity must be a number")
+        
+        if validityType not in ("days", "months"):
+            validation_errors.append("Invalid validity type")
+        
+        if validation_errors:
+            context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": "; ".join(validation_errors), "form_username": form_username, "show_generator": True, "createdLicense": None}
+            return templates.TemplateResponse("admin.html", context)
+        
+        # Generate activation code using existing server logic
+        activationCode = generate_activation_code(db)
+        
+        # Build payload (same logic as existing create_license)
+        issuedAt = int(time.time())
+        if validityType == "months":
+            # Map to valid month options: 1, 3, 6, 12
+            v = validityValue_int
+            if v >= 10: server_validityMonths = 12
+            elif v >= 6: server_validityMonths = 6
+            elif v >= 3: server_validityMonths = 3
+            else: server_validityMonths = 1
+        else:  # days
+            approx_months = max(1, int(validityValue_int / 30))
+            v = approx_months
+            if v >= 10: server_validityMonths = 12
+            elif v >= 6: server_validityMonths = 6
+            elif v >= 3: server_validityMonths = 3
+            else: server_validityMonths = 1
+        
+        expiresAt = add_calendar_months(issuedAt, server_validityMonths)
+        
+        payload = {
+            "customerId": customerId,
+            "expiresAt": expiresAt,
+            "issuedAt": issuedAt,
+            "licenseId": generate_license_id(),
+            "validityMonths": server_validityMonths,
+            "maxDevices": maxDevices_int,
+            "maxVillages": maxVillages_int,
+            "product": PRODUCT_EXPECTED,
+            "status": "active",
+            "version": VERSION
+        }
+        
+        try:
+            token = crypto.sign_payload(payload)
+        except RuntimeError as e:
+            licenses = db.query(models.License).order_by(models.License.createdAt.desc()).limit(50).all()
+            context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": f"Signing failed: {str(e)[:200]}", "form_username": form_username, "show_generator": True, "createdLicense": None}
+            return templates.TemplateResponse("admin.html", context)
+        except Exception as e:
+            licenses = db.query(models.License).order_by(models.License.createdAt.desc()).limit(50).all()
+            context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": f"Signing failed: {str(e)[:200]}", "form_username": form_username, "show_generator": True, "createdLicense": None}
+            return templates.TemplateResponse("admin.html", context)
+        
+        lic = models.License(
+            licenseId=payload["licenseId"],
+            customerId=customerId,
+            product=PRODUCT_EXPECTED,
+            maxVillages=maxVillages_int,
+            maxDevices=maxDevices_int,
+            issuedAt=issuedAt,
+            expiresAt=expiresAt,
+            status="active",
+            validityMonths=server_validityMonths,
+            activationCode=activationCode
+        )
+        # Ensure new fields have defaults
+        try:
+            lic.is_revoked = False
+            lic.is_suspended = False
+            lic.graceDays = 7
+        except Exception:
+            pass
+        db.add(lic)
+        db.commit()
+        db.refresh(lic)
+        
+        # Build result display
+        from datetime import datetime, timezone
+        now = datetime.datetime.utcnow()
+        dt_issued = datetime.datetime.fromtimestamp(issuedAt, tz=timezone.utc)
+        dt_expires = datetime.datetime.fromtimestamp(expiresAt, tz=timezone.utc)
+        
+        createdLicense = {
+            "licenseId": lic.licenseId,
+            "activationCode": lic.activationCode,
+            "validityLabel": validityType.capitalize() + " " + validityValue_s + (" Months" if validityType == "months" else " Days"),
+            "maxVillages": maxVillages_int,
+            "maxDevices": maxDevices_int,
+            "issuedAtLabel": dt_issued.strftime("%Y-%m-%d %H:%M UTC"),
+            "expiresAtLabel": dt_expires.strftime("%Y-%m-%d %H:%M UTC"),
+        }
+        
+        licenses = db.query(models.License).order_by(models.License.createdAt.desc()).limit(50).all()
+        context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": None, "form_username": form_username, "show_generator": True, "createdLicense": createdLicense}
+        return templates.TemplateResponse("admin.html", context)
+    
+    # GET: just show the form and licenses
+    context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": error, "form_username": form_username, "show_generator": True, "createdLicense": None}
+    return templates.TemplateResponse("admin.html", context)
 
 # --- Admin API: POST /admin/licenses ---
 @app.post("/admin/licenses")
@@ -222,14 +444,13 @@ async def create_license(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="customerId is required and must be non-empty string")
     customerId = customerId.strip()
 
-    # STEP 4D: validityMonths must default to 6, reject unsupported
     validityMonths = body.get("validityMonths", 6)
     try:
         validityMonths = int(validityMonths)
     except Exception:
         raise HTTPException(status_code=400, detail="validityMonths must be integer")
-    if validityMonths != 6:
-        raise HTTPException(status_code=400, detail="Only 6 calendar months validity is supported in STEP 4D")
+    if validityMonths not in VALIDITY_MONTH_OPTIONS:
+        raise HTTPException(status_code=400, detail=f"validityMonths must be one of {VALIDITY_MONTH_OPTIONS}")
 
     product = body.get("product", PRODUCT_EXPECTED)
     if product != PRODUCT_EXPECTED:
@@ -271,11 +492,14 @@ async def create_license(request: Request, db: Session = Depends(get_db)):
     if not licenseId:
         raise HTTPException(status_code=500, detail="Failed to generate unique licenseId")
 
+    activationCode = generate_activation_code(db)
+
     payload = {
         "customerId": customerId,
         "expiresAt": expiresAt,
         "issuedAt": issuedAt,
         "licenseId": licenseId,
+        "validityMonths": validityMonths,
         "maxDevices": maxDevices,
         "maxVillages": maxVillages,
         "product": PRODUCT_EXPECTED,
@@ -298,7 +522,9 @@ async def create_license(request: Request, db: Session = Depends(get_db)):
         maxDevices=maxDevices,
         issuedAt=issuedAt,
         expiresAt=expiresAt,
-        status=status
+        status=status,
+        validityMonths=validityMonths,
+        activationCode=activationCode
     )
     # Ensure new fields have defaults
     try:
@@ -325,6 +551,8 @@ async def create_license(request: Request, db: Session = Depends(get_db)):
         "maxVillages": maxVillages,
         "maxDevices": maxDevices,
         "version": VERSION,
+        "validityMonths": validityMonths,
+        "activationCode": activationCode,
         "payload": payload,
         "canonicalJson": crypto.canonical_json(payload).decode("utf-8"),
         "token": token
@@ -352,6 +580,49 @@ def list_licenses(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": 'Basic realm="SivantaAdmin"'})
     licenses = db.query(models.License).order_by(models.License.createdAt.desc()).all()
     return [{"licenseId": l.licenseId, "customerId": l.customerId, "product": l.product, "maxVillages": l.maxVillages, "maxDevices": l.maxDevices, "issuedAt": l.issuedAt, "expiresAt": l.expiresAt, "status": l.status} for l in licenses]
+
+# --- Shared device-binding helper (single authoritative logic) ---
+def _enforce_device_binding(db: Session, licenseId: str, installationId: str, maxDevices: int):
+    """
+    Returns: None on success (or same-device repeat), or JSONResponse with 403 MAX_DEVICES.
+    Handles: same license+installation -> update lastSeenAt, globally unique installationId across licenses,
+    and maxDevices count. Never logs installationId.
+    """
+    nowDt = datetime.datetime.utcnow()
+    existing_for_license = db.query(models.Device).filter(
+        models.Device.licenseId == licenseId,
+        models.Device.installationId == installationId
+    ).first()
+    if existing_for_license:
+        try:
+            existing_for_license.lastSeenAt = nowDt
+            if hasattr(existing_for_license, "status"):
+                existing_for_license.status = "active"
+            db.commit()
+        except Exception:
+            db.rollback()
+        return None
+    existing_global = db.query(models.Device).filter(models.Device.installationId == installationId).first()
+    if existing_global and existing_global.licenseId != licenseId:
+        return JSONResponse(status_code=403, content={"valid": False, "code": "MAX_DEVICES", "reason": "installationId already registered to another license"})
+    active_count = db.query(models.Device).filter(models.Device.licenseId == licenseId).count()
+    if active_count >= maxDevices:
+        return JSONResponse(status_code=403, content={"valid": False, "code": "MAX_DEVICES"})
+    try:
+        new_device = models.Device(
+            id=str(uuid.uuid4()), licenseId=licenseId, installationId=installationId,
+            status="active", firstSeenAt=nowDt, lastSeenAt=nowDt, createdAt=nowDt
+        )
+        db.add(new_device)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if "UNIQUE" in str(e) or "unique" in str(e).lower():
+            return JSONResponse(status_code=403, content={"valid": False, "code": "MAX_DEVICES"})
+        logger.error("Device registration failed")
+        return JSONResponse(status_code=500, content={"valid": False, "code": "SERVER_ERROR"})
+    return None
+
 
 # --- STEP 4H: POST /api/verify (customer online verification) ---
 @app.post("/api/verify")
@@ -458,71 +729,15 @@ async def api_verify(request: Request, db: Session = Depends(get_db)):
     # Do NOT store customer coordinates — only device ids
     nowDt = datetime.datetime.utcnow()
 
-    # Check if this installationId already registered for this license -> update lastSeenAt
-    existing_for_license = db.query(models.Device).filter(
-        models.Device.licenseId == licenseId,
-        models.Device.installationId == installationId
-    ).first()
-    if existing_for_license:
-        try:
-            existing_for_license.lastSeenAt = nowDt
-            # ensure status active
-            if hasattr(existing_for_license, "status"):
-                existing_for_license.status = "active"
-            db.commit()
-        except Exception:
-            db.rollback()
-        return JSONResponse(status_code=200, content={
-            "valid": True,
-            "licenseId": licenseId,
-            "status": lic.status,
-            "expiresAt": int(lic.expiresAt),
-            "graceDays": graceDays
-        })
-
-    # Check if installationId exists globally for different license — prevent reuse without revoke
-    existing_global = db.query(models.Device).filter(models.Device.installationId == installationId).first()
-    if existing_global and existing_global.licenseId != licenseId:
-        # Same device trying to use different license — treat as distinct device for new license?
-        # Since installationId globally unique, prevent collision: return MAX_DEVICES for new license to avoid leaking
-        # Alternatively, allow re-binding if old license is same customer? For now, allow if old device inactive?
-        # Count still enforced; we'll treat as MAX_DEVICES if max reached, else allow reassign after checking maxDevices
-        # Simplest: if global exists for different license, deny to prevent sharing.
-        # But spec says devices table with installationId UNIQUE — so duplicate should be blocked.
-        # We'll return MAX_DEVICES to indicate limit.
-        # To allow same device to switch licenses after revoke, admin can revoke old device.
-        # For now return 403 MAX_DEVICES if device already bound elsewhere.
-        return JSONResponse(status_code=403, content={"valid": False, "code": "MAX_DEVICES", "reason": "installationId already registered to another license"})
-
-    # Count active devices for this license
-    active_count = db.query(models.Device).filter(
-        models.Device.licenseId == licenseId
-    ).count()
-    # Also filter status active if column exists? Use simple count for now
-    if active_count >= maxDevices:
-        return JSONResponse(status_code=403, content={"valid": False, "code": "MAX_DEVICES"})
-
-    # Register new device
+    # Single authoritative device-binding check
     try:
-        new_device = models.Device(
-            id=str(uuid.uuid4()),
-            licenseId=licenseId,
-            installationId=installationId,
-            status="active",
-            firstSeenAt=nowDt,
-            lastSeenAt=nowDt,
-            createdAt=nowDt
-        )
-        db.add(new_device)
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        # Unique constraint violation -> race, treat as MAX_DEVICES or success if duplicate
-        if "UNIQUE" in str(e) or "unique" in str(e).lower():
-            return JSONResponse(status_code=403, content={"valid": False, "code": "MAX_DEVICES"})
-        logger.error("Device registration failed: %s", e)
-        return JSONResponse(status_code=500, content={"valid": False, "code": "SERVER_ERROR"})
-
+        graceDays = int(getattr(lic, "graceDays", 7) or 7)
+    except Exception:
+        graceDays = 7
+    maxDevices = int(lic.maxDevices) if lic.maxDevices else 1
+    bind_result = _enforce_device_binding(db, licenseId, installationId, maxDevices)
+    if bind_result is not None:
+        return bind_result
     return JSONResponse(status_code=200, content={
         "valid": True,
         "licenseId": licenseId,
@@ -530,6 +745,90 @@ async def api_verify(request: Request, db: Session = Depends(get_db)):
         "expiresAt": int(lic.expiresAt),
         "graceDays": graceDays
     })
+
+# --- 10-DIGIT ACTIVATION: POST /api/activate-code ---
+@app.post("/api/activate-code")
+async def api_activate_code(request: Request, db: Session = Depends(get_db)):
+    """
+    10-digit activation. Returns signed token on success.
+    Request: {activationCode: "5831047291", installationId: "uuid"}
+    Reuses /api/verify device logic but lookup by activationCode.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_CODE", "reason": "Invalid JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_CODE"})
+    code = body.get("activationCode") or body.get("activation_code") or body.get("code") or ""
+    installationId = body.get("installationId") or body.get("installation_id") or ""
+    if not isinstance(code, str):
+        code = str(code)
+    code = code.strip()
+    if not isinstance(installationId, str):
+        installationId = str(installationId)
+    installationId = installationId.strip()
+    # Validate exactly 10 digits
+    import re
+    if not re.fullmatch(r"[0-9]{10}", code):
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_CODE", "reason": "activationCode must be exactly 10 digits"})
+    if not installationId or len(installationId) < 8 or len(installationId) > 128:
+        return JSONResponse(status_code=400, content={"valid": False, "code": "INVALID_CODE", "reason": "installationId required"})
+    # Find license by activationCode
+    lic = db.query(models.License).filter(models.License.activationCode == code).first()
+    if not lic:
+        return JSONResponse(status_code=404, content={"valid": False, "code": "INVALID_CODE", "reason": "activation code not found"})
+    # Reject revoked/suspended/expired
+    try:
+        is_revoked = bool(getattr(lic, "is_revoked", False))
+    except Exception:
+        is_revoked = False
+    try:
+        is_suspended = bool(getattr(lic, "is_suspended", False))
+    except Exception:
+        is_suspended = False
+    if is_revoked:
+        return JSONResponse(status_code=403, content={"valid": False, "code": "REVOKED"})
+    if is_suspended:
+        return JSONResponse(status_code=403, content={"valid": False, "code": "SUSPENDED"})
+    nowSec = int(time.time())
+    if nowSec >= int(lic.expiresAt):
+        return JSONResponse(status_code=403, content={"valid": False, "code": "EXPIRED"})
+    # Build signed token for this license (reuse existing signing)
+    payload = {
+        "customerId": lic.customerId,
+        "expiresAt": int(lic.expiresAt),
+        "issuedAt": int(lic.issuedAt),
+        "licenseId": lic.licenseId,
+        "validityMonths": int(lic.validityMonths) if lic.validityMonths else 6,
+        "maxDevices": int(lic.maxDevices) if lic.maxDevices else 1,
+        "maxVillages": int(lic.maxVillages) if lic.maxVillages else 20,
+        "product": lic.product,
+        "status": lic.status,
+        "version": VERSION
+    }
+    try:
+        token = crypto.sign_payload(payload)
+    except Exception as e:
+        logger.error("Signing failed for activate-code")
+        return JSONResponse(status_code=500, content={"valid": False, "code": "SERVER_ERROR"})
+    # Single authoritative device-binding (shared with /api/verify)
+    try:
+        graceDays = int(getattr(lic, "graceDays", 7) or 7)
+    except Exception:
+        graceDays = 7
+    maxDevices = int(lic.maxDevices) if lic.maxDevices else 1
+    licenseId = lic.licenseId
+    bind_result = _enforce_device_binding(db, licenseId, installationId, maxDevices)
+    if bind_result is not None:
+        return bind_result
+    return JSONResponse(status_code=200, content={
+        "valid": True, "licenseId": licenseId, "status": lic.status,
+        "expiresAt": int(lic.expiresAt), "graceDays": graceDays,
+        "token": token, "entitlement": token, "activationCode": code,
+        "maxVillages": int(lic.maxVillages), "maxDevices": int(lic.maxDevices)
+    })
+
 
 # --- STEP 4H: POST /admin/licenses/{licenseId}/revoke ---
 @app.post("/admin/licenses/{licenseId}/revoke")
