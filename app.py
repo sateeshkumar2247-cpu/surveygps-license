@@ -134,17 +134,6 @@ async def startup_verify_keys():
         raise
 
 def check_admin(request: Request) -> bool:
-    """Check admin authentication via HTTP Basic auth header OR session cookie."""
-    # Check session cookie first (for browser-based admin page)
-    cookie = request.cookies.get("admin_session")
-    if cookie:
-        admin_user = os.getenv("ADMIN_USER")
-        admin_pass = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or ""
-        # Session was validated at login time; consider any non-empty session as authenticated
-        # since login already verified credentials against env vars
-        if admin_user and admin_pass:
-            return True
-    # Fall back to HTTP Basic auth header (existing API behavior)
     user = os.getenv("ADMIN_USER") or ADMIN_USER
     passwd = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or ADMIN_PASS
     if not user or not passwd:
@@ -152,7 +141,6 @@ def check_admin(request: Request) -> bool:
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Basic "):
         try:
-            import base64
             decoded = base64.b64decode(auth[6:]).decode("utf-8")
             if ":" not in decoded:
                 return False
@@ -233,199 +221,13 @@ def public_key():
         raise HTTPException(status_code=500, detail="Public key not available")
 
 # --- Admin UI ---
-@app.post("/admin/login", response_class=HTMLResponse)
-async def admin_login(request: Request, db: Session = Depends(get_db)):
-    """Form-based login: validate admin credentials against env vars."""
-    form = await request.form()
-    username = form.get("username", "")
-    password = form.get("password", "")
-    # Validate against environment variables (same logic as check_admin)
-    admin_user = os.getenv("ADMIN_USER")
-    admin_pass = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or ""
-    valid = bool(username and password and secrets.compare_digest(username, admin_user) and secrets.compare_digest(password, admin_pass))
-    if not valid:
-        return templates.TemplateResponse("admin.html", {"request": request, "error": "Invalid admin username or password", "form_username": username, "show_generator": False, "product": PRODUCT_EXPECTED})
-    # Login successful: set a signed session cookie (opaque token) and show generator
-    session_token = secrets.token_urlsafe(32)
-    response = templates.TemplateResponse("admin.html", {"request": request, "error": None, "form_username": username, "show_generator": True, "product": PRODUCT_EXPECTED, "session_token": session_token})
-    response.set_cookie(key="admin_session", value=session_token, httponly=True, secure=True, samesite="lax")
-    return response
-
-def _admin_authenticated(request: Request) -> bool:
-    """Check for valid admin session cookie or HTTP Basic auth."""
-    # Check cookie first
-    cookie = request.cookies.get("admin_session")
-    if cookie:
-        # Validate against env vars (simple session check — credentials were already verified at login)
-        admin_user = os.getenv("ADMIN_USER")
-        admin_pass = os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or ""
-        # For cookie-based auth, we consider any non-empty session as authenticated
-        # since login already verified credentials against env vars
-        return bool(cookie and admin_user and admin_pass)
-    # Fall back to HTTP Basic auth header
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Basic "):
-        try:
-            import base64
-            decoded = base64.b64decode(auth[6:]).decode("utf-8")
-            if ":" not in decoded:
-                return False
-            u, p = decoded.split(":", 1)
-            return secrets.compare_digest(u, os.getenv("ADMIN_USER")) and secrets.compare_digest(p, os.getenv("ADMIN_PASS") or os.getenv("ADMIN_PASSWORD") or "")
-        except Exception:
-            return False
-    return False
-
 @app.get("/admin", response_class=HTMLResponse)
 @app.get("/admin/", response_class=HTMLResponse)
-@app.post("/admin", response_class=HTMLResponse)
-@app.post("/admin/", response_class=HTMLResponse)
-async def admin_home(request: Request, db: Session = Depends(get_db)):
-    show_generator = _admin_authenticated(request)
-    error = None
-    form_username = ""
-    createdLicense = None
-    
-    if not show_generator:
-        # Show login form
-        return templates.TemplateResponse("admin.html", {"request": request, "error": "Please log in to access the license generator", "form_username": "", "show_generator": False, "product": PRODUCT_EXPECTED})
-    
-    # Authenticated: show generator form and existing licenses
+def admin_home(request: Request, db: Session = Depends(get_db)):
+    # Allow unauthenticated GET to show the generator form; POST /admin/licenses still requires auth
     licenses = db.query(models.License).order_by(models.License.createdAt.desc()).limit(50).all()
-    
-    # Handle POST: license creation form submission
-    if request.method == "POST":
-        form = await request.form()
-        customerId = form.get("customerId", "").strip()
-        maxVillages_s = form.get("maxVillages", "20").strip()
-        maxDevices_s = form.get("maxDevices", "1").strip()
-        validityType = form.get("validityType", "days").strip()
-        validityValue_s = form.get("validityValue", "30").strip()
-        
-        # Validate inputs
-        validation_errors = []
-        if not customerId:
-            validation_errors.append("Customer ID is required")
-        try:
-            maxVillages_int = int(maxVillages_s)
-            if not (1 <= maxVillages_int <= 1000):
-                validation_errors.append("Max Villages must be between 1 and 1000")
-        except ValueError:
-            validation_errors.append("Max Villages must be an integer")
-        try:
-            maxDevices_int = int(maxDevices_s)
-            if not (1 <= maxDevices_int <= 100):
-                validation_errors.append("Max Devices must be between 1 and 100")
-        except ValueError:
-            validation_errors.append("Max Devices must be an integer")
-        
-        # Validate validity
-        try:
-            validityValue_int = int(validityValue_s)
-            if validityValue_int <= 0:
-                validation_errors.append("Validity must be positive")
-        except ValueError:
-            validation_errors.append("Validity must be a number")
-        
-        if validityType not in ("days", "months"):
-            validation_errors.append("Invalid validity type")
-        
-        if validation_errors:
-            context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": "; ".join(validation_errors), "form_username": form_username, "show_generator": True, "createdLicense": None}
-            return templates.TemplateResponse("admin.html", context)
-        
-        # Generate activation code using existing server logic
-        activationCode = generate_activation_code(db)
-        
-        # Build payload (same logic as existing create_license)
-        issuedAt = int(time.time())
-        if validityType == "months":
-            # Map to valid month options: 1, 3, 6, 12
-            v = validityValue_int
-            if v >= 10: server_validityMonths = 12
-            elif v >= 6: server_validityMonths = 6
-            elif v >= 3: server_validityMonths = 3
-            else: server_validityMonths = 1
-        else:  # days
-            approx_months = max(1, int(validityValue_int / 30))
-            v = approx_months
-            if v >= 10: server_validityMonths = 12
-            elif v >= 6: server_validityMonths = 6
-            elif v >= 3: server_validityMonths = 3
-            else: server_validityMonths = 1
-        
-        expiresAt = add_calendar_months(issuedAt, server_validityMonths)
-        
-        payload = {
-            "customerId": customerId,
-            "expiresAt": expiresAt,
-            "issuedAt": issuedAt,
-            "licenseId": generate_license_id(),
-            "validityMonths": server_validityMonths,
-            "maxDevices": maxDevices_int,
-            "maxVillages": maxVillages_int,
-            "product": PRODUCT_EXPECTED,
-            "status": "active",
-            "version": VERSION
-        }
-        
-        try:
-            token = crypto.sign_payload(payload)
-        except RuntimeError as e:
-            licenses = db.query(models.License).order_by(models.License.createdAt.desc()).limit(50).all()
-            context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": f"Signing failed: {str(e)[:200]}", "form_username": form_username, "show_generator": True, "createdLicense": None}
-            return templates.TemplateResponse("admin.html", context)
-        except Exception as e:
-            licenses = db.query(models.License).order_by(models.License.createdAt.desc()).limit(50).all()
-            context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": f"Signing failed: {str(e)[:200]}", "form_username": form_username, "show_generator": True, "createdLicense": None}
-            return templates.TemplateResponse("admin.html", context)
-        
-        lic = models.License(
-            licenseId=payload["licenseId"],
-            customerId=customerId,
-            product=PRODUCT_EXPECTED,
-            maxVillages=maxVillages_int,
-            maxDevices=maxDevices_int,
-            issuedAt=issuedAt,
-            expiresAt=expiresAt,
-            status="active",
-            validityMonths=server_validityMonths,
-            activationCode=activationCode
-        )
-        # Ensure new fields have defaults
-        try:
-            lic.is_revoked = False
-            lic.is_suspended = False
-            lic.graceDays = 7
-        except Exception:
-            pass
-        db.add(lic)
-        db.commit()
-        db.refresh(lic)
-        
-        # Build result display
-        from datetime import datetime, timezone
-        now = datetime.datetime.utcnow()
-        dt_issued = datetime.datetime.fromtimestamp(issuedAt, tz=timezone.utc)
-        dt_expires = datetime.datetime.fromtimestamp(expiresAt, tz=timezone.utc)
-        
-        createdLicense = {
-            "licenseId": lic.licenseId,
-            "activationCode": lic.activationCode,
-            "validityLabel": validityType.capitalize() + " " + validityValue_s + (" Months" if validityType == "months" else " Days"),
-            "maxVillages": maxVillages_int,
-            "maxDevices": maxDevices_int,
-            "issuedAtLabel": dt_issued.strftime("%Y-%m-%d %H:%M UTC"),
-            "expiresAtLabel": dt_expires.strftime("%Y-%m-%d %H:%M UTC"),
-        }
-        
-        licenses = db.query(models.License).order_by(models.License.createdAt.desc()).limit(50).all()
-        context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": None, "form_username": form_username, "show_generator": True, "createdLicense": createdLicense}
-        return templates.TemplateResponse("admin.html", context)
-    
-    # GET: just show the form and licenses
-    context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED, "error": error, "form_username": form_username, "show_generator": True, "createdLicense": None}
-    return templates.TemplateResponse("admin.html", context)
+    context = {"request": request, "licenses": licenses, "product": PRODUCT_EXPECTED}
+    return templates.TemplateResponse(request, "admin.html", context)
 
 # --- Admin API: POST /admin/licenses ---
 @app.post("/admin/licenses")
