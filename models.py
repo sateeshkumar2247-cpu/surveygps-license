@@ -13,9 +13,11 @@ class License(Base):
     issuedAt = Column(Integer, nullable=False)  # epoch seconds UTC
     expiresAt = Column(Integer, nullable=False)
     status = Column(String, nullable=False, default="active")
+    validityMonths = Column(Integer, nullable=False, default=6)
     is_revoked = Column(Boolean, nullable=False, default=False)
     is_suspended = Column(Boolean, nullable=False, default=False)
     graceDays = Column(Integer, nullable=False, default=7)
+    activationCode = Column(String, nullable=True, unique=True)  # 10-digit numeric
     createdAt = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
 
 class Device(Base):
