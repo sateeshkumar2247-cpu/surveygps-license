@@ -1,0 +1,96 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>SivantaAdmin License Server</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:system-ui,Segoe UI,Roboto,sans-serif;padding:24px;max-width:900px;margin:auto;background:#fafafa}header{background:#1B4332;color:#fff;padding:16px;border-radius:8px} .card{background:#fff;border:1px solid #ddd;border-radius:8px;padding:16px;margin-top:16px} label{display:block;font-weight:600;margin:8px 0 4px} input,select{width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box} button{padding:12px 16px;border:none;border-radius:6px;cursor:pointer} .btn-primary{background:#1B4332;color:#fff;width:100%;font-size:16px;font-weight:700;margin-top:16px} .btn-primary:disabled{opacity:.6} .result{background:#E8F5E9;border:2px solid #1B4332;border-radius:8px;padding:20px;margin-top:16px} .code{font-family:monospace;font-size:28px;letter-spacing:0.12em;text-align:center;background:#fff;padding:16px;border-radius:6px;border:1px solid #1B4332;margin:8px 0;font-weight:800;color:#1B4332} .muted{color:#666;font-size:13px} .row{display:grid;grid-template-columns:1fr 1fr;gap:12px} @media(max-width:600px){.row{grid-template-columns:1fr}} .copy{width:100%;margin-top:8px} .hidden{display:none}</style>
+</head><body>
+<header><h2 style="margin:0">Sivanta License Generator</h2><p style="margin:6px 0 0;opacity:.9">Dedicated license server • Ed25519 • SIVANTA1.*.* • 10-digit activation code</p></header>
+<p class="muted">Auth: HTTP Basic <code>ADMIN_USER</code>/<code>ADMIN_PASS</code> (also accepts <code>ADMIN_PASSWORD</code>). Public key: <a href="/.well-known/public_key.pem">/.well-known/public_key.pem</a></p>
+
+<div class="card">
+<h3 style="margin-top:0">Sivanta GPS & GIS — License Generator</h3>
+<label>Admin Username</label><input id="adminUser" autocomplete="username" placeholder="ADMIN_USER">
+<label>Admin Password</label><input id="adminPass" type="password" autocomplete="current-password" placeholder="ADMIN_PASS">
+<label>Customer ID</label><input id="customerId" placeholder="e.g. TEST-DAYS">
+<div class="row"><div><label>Max Villages</label><input id="maxVillages" type="number" value="20" min="1" max="1000"></div><div><label>Max Devices</label><input id="maxDevices" type="number" value="1" min="1" max="100"></div></div>
+<div class="row"><div><label>Validity Type</label><select id="validityType" onchange="onTypeChange()"><option value="days">Days</option><option value="months">Months</option></select></div><div><label>Validity</label><input id="validityValue" type="number" value="30" min="1" max="3650"></div></div>
+<button class="btn-primary" onclick="createLicense()">CREATE LICENSE</button>
+<p id="err" style="color:#C62828;display:none;margin-top:12px"></p>
+</div>
+
+<div id="result" class="result hidden">
+<h3 style="margin:0;color:#1B4332">LICENSE CREATED ✓</h3>
+<p><b>License ID:</b> <code id="rLicenseId"></code></p>
+<p><b>Activation Code:</b></p><div id="rCode" class="code"></div>
+<p><b>Validity:</b> <span id="rValidity"></span></p>
+<p><b>Max Villages:</b> <span id="rVillages"></span> &nbsp; <b>Max Devices:</b> <span id="rDevices"></span></p>
+<p><b>Issued:</b> <span id="rIssued"></span> &nbsp; <b>Expires:</b> <span id="rExpires"></span></p>
+<button class="btn-primary copy" onclick="copyCode()">COPY ACTIVATION CODE</button>
+<button class="btn-primary copy" style="background:#2D6A4F" onclick="copyId()">COPY LICENSE ID</button>
+</div>
+
+<div class="card">
+<h3>Recent Licenses ({{licenses|length}})</h3>
+<table style="width:100%;border-collapse:collapse"><tr style="background:#2D6A4F;color:#fff"><th style="padding:6px;border:1px solid #ccc">License ID</th><th style="padding:6px;border:1px solid #ccc">Customer</th><th style="padding:6px;border:1px solid #ccc">Villages</th><th style="padding:6px;border:1px solid #ccc">Devices</th><th style="padding:6px;border:1px solid #ccc">Issued</th><th style="padding:6px;border:1px solid #ccc">Expires</th><th style="padding:6px;border:1px solid #ccc">Status</th></tr>
+{% for l in licenses %}<tr><td style="padding:6px;border:1px solid #ccc"><code>{{l.licenseId}}</code></td><td style="padding:6px;border:1px solid #ccc">{{l.customerId}}</td><td style="padding:6px;border:1px solid #ccc">{{l.maxVillages}}</td><td style="padding:6px;border:1px solid #ccc">{{l.maxDevices}}</td><td style="padding:6px;border:1px solid #ccc">{{l.issuedAt}}</td><td style="padding:6px;border:1px solid #ccc">{{l.expiresAt}}</td><td style="padding:6px;border:1px solid #ccc">{{l.status}}</td></tr>{% else %}<tr><td colspan="7" style="color:#888;text-align:center;padding:8px">No licenses yet</td></tr>{% endfor %}</table>
+<p class="muted">Product: <code>{{product}}</code> • Token format: <code>SIVANTA1.&lt;base64url(canonical-json)&gt;.&lt;base64url(ed25519-signature)&gt;</code></p>
+</div>
+
+<script>
+function onTypeChange(){
+  const t=document.getElementById('validityType').value;
+  const v=document.getElementById('validityValue');
+  if(t==='days'){v.min=1;v.max=3650;if(v.value>3650)v.value=3650;if(v.value<1)v.value=30}
+  else{v.min=1;v.max=12;if(v.value>12)v.value=6;if(v.value<1)v.value=6}
+}
+function fmt(ts){ const d=new Date(ts*1000); const utc=d.toISOString().replace('T',' ').slice(0,16)+' UTC'; const ist=d.toLocaleString('en-IN',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).replace(',',''); return ist+' IST ('+utc+')';}
+function mapToMonths(val,type){
+  if(type==='months'){
+    const n=parseInt(val,10);
+    if(n>=10)return 12; if(n>=6)return 6; if(n>=3)return 3; return 1;
+  }else{
+    const days=parseInt(val,10);
+    const approx=Math.max(1,Math.round(days/30));
+    if(approx>=10)return 12; if(approx>=6)return 6; if(approx>=3)return 3; return 1;
+  }
+}
+async function createLicense(){
+  const err=document.getElementById('err'); err.style.display='none'; err.textContent='';
+  const adminUser=document.getElementById('adminUser').value.trim();
+  const adminPass=document.getElementById('adminPass').value;
+  const customerId=document.getElementById('customerId').value.trim();
+  const maxVillages=parseInt(document.getElementById('maxVillages').value,10);
+  const maxDevices=parseInt(document.getElementById('maxDevices').value,10);
+  const validityType=document.getElementById('validityType').value;
+  const validityValue=document.getElementById('validityValue').value.trim();
+  if(!adminUser||!adminPass){err.textContent='Admin Username and Password required';err.style.display='block';return}
+  if(!customerId){err.textContent='Customer ID required';err.style.display='block';return}
+  const vInt=parseInt(validityValue,10);
+  if(!(vInt>0)){err.textContent='Validity must be positive';err.style.display='block';return}
+  if(validityType==='days' && (vInt<1||vInt>3650)){err.textContent='Days must be 1-3650';err.style.display='block';return}
+  if(validityType==='months' && (vInt<1||vInt>12)){err.textContent='Months must be 1-12';err.style.display='block';return}
+  if(!(maxVillages>=1&&maxVillages<=1000)){err.textContent='Max Villages 1-1000';err.style.display='block';return}
+  if(!(maxDevices>=1&&maxDevices<=100)){err.textContent='Max Devices 1-100';err.style.display='block';return}
+  const validityMonths=mapToMonths(validityValue,validityType);
+  const cred=btoa(adminUser+':'+adminPass);
+  const body={customerId, validityMonths, maxVillages, maxDevices};
+  const btn=document.querySelector('.btn-primary'); btn.disabled=true; btn.textContent='Creating...';
+  try{
+    const resp=await fetch('/admin/licenses',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Basic '+cred},body:JSON.stringify(body)});
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok){ throw new Error(data.detail||data.message||('HTTP '+resp.status));}
+    document.getElementById('rLicenseId').textContent=data.licenseId||'';
+    document.getElementById('rCode').textContent=data.activationCode||'';
+    document.getElementById('rValidity').textContent=(validityType==='months'?vInt+' Months':vInt+' Days')+' (server '+validityMonths+' months)';
+    document.getElementById('rVillages').textContent=data.maxVillages;
+    document.getElementById('rDevices').textContent=data.maxDevices;
+    document.getElementById('rIssued').textContent=fmt(data.issuedAt);
+    document.getElementById('rExpires').textContent=fmt(data.expiresAt);
+    document.getElementById('result').classList.remove('hidden');
+    document.getElementById('result').scrollIntoView({behavior:'smooth'});
+  }catch(e){err.textContent=e.message;err.style.display='block';}
+  finally{btn.disabled=false;btn.textContent='CREATE LICENSE';}
+}
+function copyCode(){ const c=document.getElementById('rCode').textContent.trim(); if(!c)return; navigator.clipboard.writeText(c).then(()=>{const b=event.target;b.textContent='COPIED!';setTimeout(()=>b.textContent='COPY ACTIVATION CODE',1500)});}
+function copyId(){ const c=document.getElementById('rLicenseId').textContent.trim(); if(!c)return; navigator.clipboard.writeText(c).then(()=>{const b=event.target;b.textContent='COPIED!';setTimeout(()=>b.textContent='COPY LICENSE ID',1500)});}
+</script>
+</body></html>
