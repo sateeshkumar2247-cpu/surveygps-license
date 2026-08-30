@@ -4,6 +4,10 @@ services:
     env: python
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
+    disk:
+      name: sivanta-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
     envVars:
       - key: ADMIN_USER
         sync: false
